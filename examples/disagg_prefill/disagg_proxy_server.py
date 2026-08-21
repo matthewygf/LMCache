@@ -317,6 +317,15 @@ def parse_args():
         default=256,
         help="LMCache chunk size in tokens (must match the LMCache config).",
     )
+    parser.add_argument(
+        "--kv-ready-timeout",
+        type=float,
+        default=300.0,
+        help=(
+            "Seconds to wait for the prefiller's KV-ready signal before"
+            " failing the request. Use 0 to wait indefinitely."
+        ),
+    )
 
     args = parser.parse_args()
     return args
@@ -440,7 +449,23 @@ def round_robin_pick_clients() -> tuple[ClientInfo, ClientInfo, ClientInfo]:
 
 
 async def wait_decode_kv_ready(req_id: str, num_tp_rank: int):
+    """Block until the prefiller reports KV readiness for *req_id*.
+
+    Raises ``TimeoutError`` once ``--kv-ready-timeout`` elapses, so a lost or
+    never-sent notification surfaces as a failed request rather than a
+    connection that hangs forever. A timeout of 0 waits indefinitely.
+    """
+    timeout = global_args.kv_ready_timeout
+    deadline = time.monotonic() + timeout if timeout > 0 else None
+
     while app.state.finished_reqs[req_id] < num_tp_rank:
+        if deadline is not None and time.monotonic() > deadline:
+            received = app.state.finished_reqs.pop(req_id, 0)
+            raise TimeoutError(
+                f"Timed out after {timeout}s waiting for the prefiller to"
+                f" signal KV ready for req {req_id}: got {received} of"
+                f" {num_tp_rank} expected signals."
+            )
         await asyncio.sleep(0.0001)  # sleep for 0.1 ms
     logger.debug(f"Prefill node signaled kv ready for req {req_id}")
     app.state.finished_reqs.pop(req_id)
